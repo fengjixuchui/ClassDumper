@@ -11,7 +11,7 @@ BOOL APIENTRY DllMain(HMODULE hModule,
 	switch (ul_reason_for_call)
 	{
 	case DLL_PROCESS_ATTACH:
-		CreateThread(nullptr, NULL, reinterpret_cast<LPTHREAD_START_ROUTINE>(&DllThread), hModule, NULL, nullptr);
+		CreateThread(nullptr, NULL, &DllThread, hModule, NULL, nullptr);
 		break;
 	case DLL_THREAD_ATTACH:
 	case DLL_THREAD_DETACH:
@@ -21,8 +21,9 @@ BOOL APIENTRY DllMain(HMODULE hModule,
 	return TRUE;
 }
 
-void DllThread(HMODULE hModule)
+DWORD WINAPI DllThread(void* lpParam)
 {
+	HMODULE hModule = reinterpret_cast<HMODULE>(lpParam);
 	g_console.Write(HeadingArt);
 	const auto start = chrono::high_resolution_clock::now();
 	auto moduleList = GetModuleList(hModule); // Skip our module, we dont need that one
@@ -45,7 +46,7 @@ void DllThread(HMODULE hModule)
 		SectionInfo* sectInfo = GetSectionInformation(targetModule);
 		if (!sectInfo)
 		{
-			g_console.WriteBold("Error: NULL Section Information!\n");
+			g_console.WriteBold("[!] Error: NULL Section Information!\n");
 			continue;
 		}
 
@@ -69,7 +70,7 @@ void DllThread(HMODULE hModule)
 	const auto end = chrono::high_resolution_clock::now();
 	g_console.FWrite("[+] Took %d milliseconds\n", chrono::duration_cast<chrono::milliseconds>(end - start).count());
 	g_console.Write("[i] Output will be in Desktop\\Class_Dumper\\...");
-	g_console.WaitInput();
 	CloseLogs();
-	FreeLibraryAndExitThread(hModule, -1);
+	g_console.WaitInput();
+	FreeLibraryAndExitThread(hModule, 0);
 }

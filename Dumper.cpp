@@ -1,144 +1,5 @@
 #include "Dumper.h"
 
-
-bool IsValid(void* VTable_start, SectionInfo* sectionInfo)
-{
-	auto* vtable = static_cast<uintptr_t*>(VTable_start);
-	auto* meta = vtable - 1;
-	if (sectionInfo->RDATA.base <= *meta && *meta <= sectionInfo->RDATA.end)
-	{
-		if (sectionInfo->TEXT.base <= *vtable && *vtable <= sectionInfo->TEXT.end)
-		{
-			auto* COL = reinterpret_cast<CompleteObjectLocator*>(*meta);
-#ifdef _WIN64
-			if (COL->signature == 1)
-			{
-				auto *descriptor = COL->GetTypeDescriptor();
-#else
-			if (COL->signature == 0) {
-				auto descriptor = COL->pTypeDescriptor;
-#endif
-				if (IsBadReadPointer(reinterpret_cast<void*>(descriptor)) != 0)
-				{
-					return false;
-				}
-				// Test if string is ".?AV" real quick
-				if (*reinterpret_cast<unsigned long*>(&descriptor->name) == TYPEDESCRIPTOR_SIGNITURE)
-				{
-					return true;
-				}
-			}
-		}
-	}
-	return false;
-}
-
-vector<uintptr_t> GetListOfFunctions(void* VTable_start, SectionInfo* sectionInfo)
-{
-	vector<uintptr_t> functionList;
-	auto* vtable = static_cast<uintptr_t*>(VTable_start);
-	auto function_ptr = *vtable;
-	while (sectionInfo->TEXT.base <= function_ptr && function_ptr <= sectionInfo->TEXT.end)
-	{
-		functionList.push_back(function_ptr);
-		vtable++;
-		function_ptr = *vtable;
-	}
-	return functionList;
-}
-
-vector<uintptr_t> FindAllVTables(SectionInfo* sectionInfo)
-{
-	vector<uintptr_t> vtableList;
-	uintptr_t ptr = sectionInfo->RDATA.base + sizeof(uintptr_t);
-	while (ptr < sectionInfo->RDATA.end)
-	{
-		if (IsValid(reinterpret_cast<void*>(ptr), sectionInfo))
-		{
-			vtableList.push_back(ptr);
-		}
-		ptr += sizeof(uintptr_t);
-	}
-	return vtableList;
-}
-
-const string VTABLE_SYMBOL_PREFIX = "??_7";
-const string VTABLE_SYMBOL_SUFFIX = "6B@";
-static char buff[0x1000];
-
-string DemangleMicrosoft(char* symbol)
-{
-	memset(buff, 0, 0x1000);
-	char* pSymbol = symbol;
-	// don't question this magic, it works :)
-	if (*static_cast<char*>(symbol + 4) == '?') pSymbol = symbol + 1;
-	else if (*static_cast<char*>(symbol) == '.') pSymbol = symbol + 4;
-	else if (*static_cast<char*>(symbol) == '?') pSymbol = symbol + 2;
-	else
-	{
-		g_console.WriteBold("invalid msvc mangled name");
-	}
-	string ModifiedSymbol = pSymbol;
-	ModifiedSymbol.insert(0, VTABLE_SYMBOL_PREFIX);
-	ModifiedSymbol.insert(ModifiedSymbol.size(), VTABLE_SYMBOL_SUFFIX);
-	if (!((UnDecorateSymbolName(ModifiedSymbol.c_str(), buff, 0x1000, 0)) != 0))
-	{
-		g_console.FWriteBold("Error Code: %d", GetLastError());
-		return string(symbol); //Failsafe
-	}
-	return string(buff);
-}
-
-void StringFilter(string& string, const std::string& substring)
-{
-	size_t pos;
-	while ((pos = string.find(substring)) != string::npos)
-	{
-		string.erase(pos, substring.length());
-	}
-}
-
-static vector<string> filters =
-{
-	"::`vftable'",
-	"const ",
-	"::`anonymous namespace'"
-};
-
-void FilterSymbol(string& symbol)
-{
-	for (auto& filter : filters)
-	{
-		StringFilter(symbol, filter);
-	}
-}
-
-bool SymbolComparator(uintptr_t v1, uintptr_t v2)
-{
-	v1 = v1 - sizeof(uintptr_t);
-	v2 = v2 - sizeof(uintptr_t);
-	auto* pv1 = reinterpret_cast<uintptr_t*>(v1);
-	auto* pv2 = reinterpret_cast<uintptr_t*>(v2);
-	auto* col1 = reinterpret_cast<CompleteObjectLocator*>(*pv1);
-	auto* col2 = reinterpret_cast<CompleteObjectLocator*>(*pv2);
-	auto* td1 = col1->GetTypeDescriptor();
-	auto* td2 = col2->GetTypeDescriptor();
-
-	const auto symbol1 = DemangleMicrosoft(&td1->name);
-	const auto symbol2 = DemangleMicrosoft(&td2->name);
-
-	if (symbol1 == symbol2)
-	{
-		return (v1 < v2);
-	}
-	return (symbol1 < symbol2);
-}
-
-void SortSymbols(vector<uintptr_t>& vtableList)
-{
-	sort(vtableList.begin(), vtableList.end(), SymbolComparator);
-}
-
 // having a big buffer seems to speed things up
 ofstream VTableLog;
 ofstream InheritanceLog;
@@ -242,17 +103,19 @@ void DumpVTableInfo(uintptr_t VTable, SectionInfo* sectionInfo)
 			<< "\t" << className << "\t" << "\n";
 	}
 	// dump functions
-	int index = 0;
 	auto FunctionList = GetListOfFunctions(reinterpret_cast<void*>(VTable), sectionInfo);
 	if (!FunctionList.empty())
 	{
 		const size_t nFunctions = FunctionList.size();
-		VTableLog << "\tVirtual Functions (" << nFunctions << "):\n";
+		VTableLog << "\tVirtual Functions (" << dec << nFunctions << "):\n";
 
 		//Simple Function Classification (Similar to IDA naming conventions)
+		int index = 0;
+		int realOffset = 0;
 		for (auto function : FunctionList)
 		{
-			VTableLog << "\t" << dec << index
+			realOffset = index * sizeof(void*);
+			VTableLog << "\t" << dec << index << "\t" << hex << realOffset
 				<< "\t" << hex << "0x" << function
 				<< "\t+" << GetRVA(function, sectionInfo);
 
@@ -295,23 +158,34 @@ void DumpInheritanceInfo(uintptr_t VTable)
 		return;
 	}
 	// iterate and dump all base classes
+	unsigned long prevMemberDisplacement = 0;
+	unsigned long tabIndex = 0;
 	for (unsigned long i = 1; i < classMeta.numBaseClasses; i++)
 	{
 		BaseClassDescriptor* pCurrentBaseClass = classMeta.GetBaseClass(i);
 		TypeDescriptor* pCurrentTypeDesc = pCurrentBaseClass->GetTypeDescriptor();
-		const ptrdiff_t mdisp = pCurrentBaseClass->where.mdisp;
-		const ptrdiff_t pdisp = pCurrentBaseClass->where.pdisp;
+		const unsigned long memberDisplacement = pCurrentBaseClass->where.mdisp;
+		const unsigned long vbtableDisplacement = pCurrentBaseClass->where.pdisp;
 		//const ptrdiff_t vdisp = pCurrentBaseClass->where.vdisp; // unused for now
-
 		string currentBaseClassName = DemangleMicrosoft(&pCurrentTypeDesc->name);
 		FilterSymbol(currentBaseClassName);
-		if (pdisp == -1)
+		if (vbtableDisplacement == -1)
 		{
+			InheritanceLog << hex << "0x" << memberDisplacement;
 			// if pdisp is -1, the vtable offset for base class is actually mdisp
-			InheritanceLog << hex << "0x" << mdisp << "\t";
+			if (memberDisplacement == prevMemberDisplacement) { 
+				tabIndex++;
+			}
+			else {
+				tabIndex = 1;
+			}
+			for (auto i = 0; i < tabIndex; i++) {
+				InheritanceLog << "\t";
+			}
 		}
 		// else, I dont know how to parse the vbtable yet;
-		InheritanceLog << currentBaseClassName << "\n";
+		InheritanceLog << "\t" << currentBaseClassName << "\n";
+		prevMemberDisplacement = memberDisplacement;
 	}
 	InheritanceLog << "\n";
 }
